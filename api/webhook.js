@@ -57,6 +57,8 @@ const MEMBERSHIP_TTL_MS = 30 * 1000;
 const DONATION_META_TTL_MS = 60 * 1000;
 const RATING_SUMMARY_TTL_MS = 15 * 1000;
 
+const SUPPORTED_MEDIA_TYPES = new Set(["photo", "video", "document"]);
+
 function escapeHtml(text = "") {
   return String(text)
     .replace(/&/g, "&amp;")
@@ -99,6 +101,42 @@ function parseJsonSafe(raw) {
   } catch {
     return null;
   }
+}
+
+function normalizeMediaType(rawType) {
+  if (typeof rawType !== "string") return null;
+  const cleaned = rawType.trim().toLowerCase();
+
+  if (cleaned === "foto" || cleaned === "image") return "photo";
+  if (cleaned === "vid" || cleaned === "animation") return "video";
+  if (cleaned === "doc" || cleaned === "file") return "document";
+
+  return SUPPORTED_MEDIA_TYPES.has(cleaned) ? cleaned : null;
+}
+
+function normalizeDonationPayload(raw) {
+  if (!raw || typeof raw !== "object") return null;
+
+  const donationCode = String(raw.donation_code || raw.code || "").trim();
+  const rawMediaType = raw.media_type ?? raw.mediaType ?? raw.type ?? null;
+  const mediaType = normalizeMediaType(rawMediaType);
+  const fileId = String(
+    raw.telegram_file_id || raw.fileId || raw.file_id || ""
+  ).trim();
+
+  if (!donationCode || !fileId) {
+    return null;
+  }
+
+  return {
+    donation_code: donationCode,
+    donor_user_id: raw.donor_user_id ?? raw.donorId ?? null,
+    media_type: mediaType,
+    raw_media_type: rawMediaType,
+    telegram_file_id: fileId,
+    caption: typeof raw.caption === "string" ? raw.caption : "",
+    status: String(raw.status || "published").trim().toLowerCase(),
+  };
 }
 
 function buildEmptyCounts() {
@@ -154,33 +192,50 @@ async function isUserBanned(userId) {
 
 // Cache-aside: memori instance -> Upstash Redis -> Supabase PostgreSQL
 async function getDonationRecord(code) {
+  const cleanCode = String(code || "").trim();
+  if (!cleanCode) return null;
+
   const now = Date.now();
-  const mem = donationMetaCache.get(code);
+  const mem = donationMetaCache.get(cleanCode);
   if (mem && mem.expiresAt > now) {
-    return mem.data;
+    if (mem.data && mem.data.status === "published" && mem.data.media_type && mem.data.telegram_file_id) {
+      return mem.data;
+    }
+    donationMetaCache.delete(cleanCode);
   }
 
-  const redisKey = `donation_meta:${code}`;
-  const redisCached = parseJsonSafe(await redis.get(redisKey));
-  if (redisCached && redisCached.donation_code && redisCached.status === "published") {
-    donationMetaCache.set(code, { data: redisCached, expiresAt: now + DONATION_META_TTL_MS });
+  const redisKey = `donation_meta:${cleanCode}`;
+  const rawRedis = await redis.get(redisKey);
+  const redisCached = normalizeDonationPayload(parseJsonSafe(rawRedis));
+  if (redisCached && redisCached.status === "published" && redisCached.media_type && redisCached.telegram_file_id) {
+    donationMetaCache.set(cleanCode, { data: redisCached, expiresAt: now + DONATION_META_TTL_MS });
     return redisCached;
+  }
+
+  if (rawRedis) {
+    await redis.del(redisKey);
   }
 
   const { data, error } = await supabase
     .from("media_donations")
     .select("donation_code, donor_user_id, media_type, telegram_file_id, caption, status")
-    .eq("donation_code", code)
+    .eq("donation_code", cleanCode)
     .eq("status", "published")
     .maybeSingle();
 
-  if (error || !data) {
+  const normalized = normalizeDonationPayload(data);
+  if (error || !normalized || !normalized.media_type || !normalized.telegram_file_id) {
+    console.warn("[Donation Record Invalid/Not Found]:", {
+      code: cleanCode,
+      dbError: error?.message || null,
+      rawMediaType: data?.media_type ?? null,
+    });
     return null;
   }
 
-  await redis.set(redisKey, JSON.stringify(data), { ex: 300 });
-  donationMetaCache.set(code, { data, expiresAt: now + DONATION_META_TTL_MS });
-  return data;
+  await redis.set(redisKey, JSON.stringify(normalized), { ex: 300 });
+  donationMetaCache.set(cleanCode, { data: normalized, expiresAt: now + DONATION_META_TTL_MS });
+  return normalized;
 }
 
 async function getRatingCounts(code) {
@@ -324,13 +379,30 @@ function extractMediaPayload(msg) {
 }
 
 async function deliverDonationMedia(ctx, code, data, counts) {
+  const normalized = normalizeDonationPayload(data);
+
+  if (!normalized || !normalized.telegram_file_id) {
+    console.error("[Deliver Media Error] Payload kosong/tidak valid:", { code, data });
+    return ctx.reply("Data media tidak ditemukan atau file sudah tidak tersedia.");
+  }
+
+  if (!normalized.media_type) {
+    console.error("[Deliver Media Error] Tipe media tidak dikenali:", {
+      code,
+      rawMediaType: normalized.raw_media_type,
+    });
+    return ctx.reply(
+      `Tipe media tidak dikenali (${escapeHtml(String(normalized.raw_media_type || "kosong"))}).`
+    );
+  }
+
   const lines = [
     "<b>Hasil Donasi Media</b>",
     `Kode: <code>${escapeHtml(code)}</code>`,
   ];
 
-  if (data.caption) {
-    lines.push(`Judul / Caption: ${escapeHtml(data.caption)}`);
+  if (normalized.caption) {
+    lines.push(`Judul / Caption: ${escapeHtml(normalized.caption)}`);
   }
 
   const extra = {
@@ -340,14 +412,12 @@ async function deliverDonationMedia(ctx, code, data, counts) {
     ...buildRatingKeyboard(code, counts),
   };
 
-  if (data.mediaType === "photo") {
-    await ctx.replyWithPhoto(data.telegram_file_id, extra);
-  } else if (data.mediaType === "video") {
-    await ctx.replyWithVideo(data.telegram_file_id, extra);
-  } else if (data.mediaType === "document") {
-    await ctx.replyWithDocument(data.telegram_file_id, extra);
-  } else {
-    await ctx.reply("Tipe media tidak dikenali.");
+  if (normalized.media_type === "photo") {
+    await ctx.replyWithPhoto(normalized.telegram_file_id, extra);
+  } else if (normalized.media_type === "video") {
+    await ctx.replyWithVideo(normalized.telegram_file_id, extra);
+  } else if (normalized.media_type === "document") {
+    await ctx.replyWithDocument(normalized.telegram_file_id, extra);
   }
 }
 
@@ -597,8 +667,12 @@ bot.on(["photo", "video", "document"], async (ctx) => {
     return ctx.reply("Gagal mengirim postingan ke Channel Private. Kuota kamu tidak terpakai, silakan coba lagi.");
   }
 
-  await redis.set(`donation_meta:${code}`, JSON.stringify(inserted), { ex: 300 });
-  donationMetaCache.set(code, { data: inserted, expiresAt: Date.now() + DONATION_META_TTL_MS });
+  const normalizedInserted = normalizeDonationPayload(inserted) || inserted;
+  await redis.set(`donation_meta:${code}`, JSON.stringify(normalizedInserted), { ex: 300 });
+  donationMetaCache.set(code, {
+    data: normalizedInserted,
+    expiresAt: Date.now() + DONATION_META_TTL_MS,
+  });
 
   await supabase.from("donation_audit_logs").insert({
     donation_code: code,
