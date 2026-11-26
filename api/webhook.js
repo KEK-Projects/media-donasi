@@ -11,7 +11,6 @@ const {
   PRIVATE_CHANNEL_INVITE_URL,
   ADMIN_GROUP_ID,
   ADMIN_GROUP_INVITE_URL,
-  COPYRIGHT_PHOTO,
   UPSTASH_REDIS_REST_URL,
   UPSTASH_REDIS_REST_TOKEN,
   SUPABASE_URL,
@@ -19,6 +18,8 @@ const {
   DAILY_DONATION_LIMIT = "5",
   DONATION_COOLDOWN_SECONDS = "30",
 } = process.env;
+
+const COPYRIGHT_PHOTO = (process.env.COPYRIGHT_PHOTO || "").trim();
 
 if (
   !BOT_TOKEN ||
@@ -48,14 +49,16 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
 
-// Warm cache di memori instance serverless (TTL singkat agar latensi ekstra rendah)
+// Warm cache di memori instance serverless
 const membershipCache = new Map(); // userId -> { allJoined, expiresAt }
 const donationMetaCache = new Map(); // code -> { data, expiresAt }
 const ratingSummaryCache = new Map(); // code -> { counts, expiresAt }
+const userSyncCache = new Map(); // `${userId}:${username || ""}` -> expiresAt
 
 const MEMBERSHIP_TTL_MS = 30 * 1000;
-const DONATION_META_TTL_MS = 60 * 1000;
-const RATING_SUMMARY_TTL_MS = 15 * 1000;
+const DONATION_META_TTL_MS = 90 * 1000;
+const RATING_SUMMARY_TTL_MS = 20 * 1000;
+const USER_SYNC_TTL_MS = 10 * 60 * 1000;
 
 const SUPPORTED_MEDIA_TYPES = new Set(["photo", "video", "document"]);
 
@@ -93,6 +96,10 @@ function getCooldownKey(userId) {
   return `donate_cooldown:${userId}`;
 }
 
+function getUserVotedKey(code, userId) {
+  return `donation_voted:${code}:${userId}`;
+}
+
 function parseJsonSafe(raw) {
   if (!raw) return null;
   if (typeof raw === "object") return raw;
@@ -120,9 +127,7 @@ function normalizeDonationPayload(raw) {
   const donationCode = String(raw.donation_code || raw.code || "").trim();
   const rawMediaType = raw.media_type ?? raw.mediaType ?? raw.type ?? null;
   const mediaType = normalizeMediaType(rawMediaType);
-  const fileId = String(
-    raw.telegram_file_id || raw.fileId || raw.file_id || ""
-  ).trim();
+  const fileId = String(raw.telegram_file_id || raw.fileId || raw.file_id || "").trim();
 
   if (!donationCode || !fileId) {
     return null;
@@ -136,6 +141,7 @@ function normalizeDonationPayload(raw) {
     telegram_file_id: fileId,
     caption: typeof raw.caption === "string" ? raw.caption : "",
     status: String(raw.status || "published").trim().toLowerCase(),
+    channel_message_id: raw.channel_message_id ?? null,
   };
 }
 
@@ -143,16 +149,85 @@ function buildEmptyCounts() {
   return { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
 }
 
-function buildRatingKeyboard(code, counts = buildEmptyCounts()) {
+function summarizeRatingRows(rows) {
+  const counts = buildEmptyCounts();
+  if (Array.isArray(rows)) {
+    for (const row of rows) {
+      const s = Number(row.score);
+      if (s >= 1 && s <= 5) counts[s] += 1;
+    }
+  }
+  return counts;
+}
+
+function computeRatingStats(counts = buildEmptyCounts()) {
+  let totalVotes = 0;
+  let weightedSum = 0;
+
+  for (let star = 1; star <= 5; star += 1) {
+    const c = Math.max(0, Number(counts[star]) || 0);
+    totalVotes += c;
+    weightedSum += star * c;
+  }
+
+  const average = totalVotes > 0 ? (weightedSum / totalVotes).toFixed(1) : null;
+  return { totalVotes, average };
+}
+
+function buildChannelCaption(code, mediaType, caption = "", counts = buildEmptyCounts()) {
+  const { totalVotes, average } = computeRatingStats(counts);
+  const ratingParam =
+    totalVotes > 0 ? `<b>${average}/5.0</b> (${totalVotes} rate)` : "<i>Belum ada rating</i>";
+
+  const lines = [
+    "<b>Copyright Media Donasi</b>",
+    `Kode Akses: <code>${escapeHtml(code)}</code>`,
+    `Tipe: ${escapeHtml(String(mediaType || "").toUpperCase())}`,
+    `Rating: ${ratingParam}`,
+  ];
+
+  if (caption) {
+    lines.push(`Caption: ${escapeHtml(caption)}`);
+  }
+
+  return lines.join("\n");
+}
+
+function buildChannelKeyboard(code) {
+  const deepLink = `https://t.me/${BOT_USERNAME}?start=${code}`;
+  return Markup.inlineKeyboard([[Markup.button.url("Lihat Media di Bot", deepLink)]]);
+}
+
+function buildBotMediaCaption(code, caption = "") {
+  const lines = [
+    "<b>Hasil Donasi Media</b>",
+    `Kode: <code>${escapeHtml(code)}</code>`,
+  ];
+
+  if (caption) {
+    lines.push(`Judul / Caption: ${escapeHtml(caption)}`);
+  }
+
+  return lines.join("\n");
+}
+
+function buildSingleTapRatingKeyboard(code) {
   return Markup.inlineKeyboard([
     [1, 2, 3, 4, 5].map((num) =>
-      Markup.button.callback(`${num}★ (${counts[num] || 0})`, `rate:${code}:${num}`)
+      Markup.button.callback(`${num}★`, `rate:${code}:${num}`)
     ),
   ]);
 }
 
-async function ensureBotUser(user) {
+async function ensureBotUserCached(user) {
   if (!user?.id) return;
+  const now = Date.now();
+  const cacheKey = `${user.id}:${user.username || ""}`;
+  const cachedExpires = userSyncCache.get(cacheKey);
+  if (cachedExpires && cachedExpires > now) {
+    return;
+  }
+
   const { error } = await supabase.from("bot_users").upsert(
     {
       telegram_user_id: user.id,
@@ -164,12 +239,14 @@ async function ensureBotUser(user) {
 
   if (error) {
     console.error("[Upsert bot_users Error]:", error.message);
+    return;
   }
+
+  userSyncCache.set(cacheKey, now + USER_SYNC_TTL_MS);
 }
 
-async function isUserBanned(userId) {
-  const cacheKey = `ban_status:${userId}`;
-  const cached = parseJsonSafe(await redis.get(cacheKey));
+async function resolveBanStatus(userId, cachedRedisBanRaw = null) {
+  const cached = parseJsonSafe(cachedRedisBanRaw);
   if (cached && typeof cached.banned === "boolean") {
     return cached.banned;
   }
@@ -186,28 +263,33 @@ async function isUserBanned(userId) {
     Boolean(data.is_banned) &&
     (!data.banned_until || new Date(data.banned_until).getTime() > Date.now());
 
-  await redis.set(cacheKey, JSON.stringify({ banned: activeBan }), { ex: 30 });
+  await redis.set(`ban_status:${userId}`, JSON.stringify({ banned: activeBan }), { ex: 45 });
   return activeBan;
 }
 
-// Cache-aside: memori instance -> Upstash Redis -> Supabase PostgreSQL
-async function getDonationRecord(code) {
+async function getDonationRecord(code, cachedRedisMetaRaw = null) {
   const cleanCode = String(code || "").trim();
   if (!cleanCode) return null;
 
   const now = Date.now();
   const mem = donationMetaCache.get(cleanCode);
   if (mem && mem.expiresAt > now) {
-    if (mem.data && mem.data.status === "published" && mem.data.media_type && mem.data.telegram_file_id) {
+    if (mem.data?.status === "published" && mem.data?.media_type && mem.data?.telegram_file_id) {
       return mem.data;
     }
     donationMetaCache.delete(cleanCode);
   }
 
   const redisKey = `donation_meta:${cleanCode}`;
-  const rawRedis = await redis.get(redisKey);
+  const rawRedis = cachedRedisMetaRaw !== undefined ? cachedRedisMetaRaw : await redis.get(redisKey);
   const redisCached = normalizeDonationPayload(parseJsonSafe(rawRedis));
-  if (redisCached && redisCached.status === "published" && redisCached.media_type && redisCached.telegram_file_id) {
+
+  if (
+    redisCached &&
+    redisCached.status === "published" &&
+    redisCached.media_type &&
+    redisCached.telegram_file_id
+  ) {
     donationMetaCache.set(cleanCode, { data: redisCached, expiresAt: now + DONATION_META_TTL_MS });
     return redisCached;
   }
@@ -218,18 +300,15 @@ async function getDonationRecord(code) {
 
   const { data, error } = await supabase
     .from("media_donations")
-    .select("donation_code, donor_user_id, media_type, telegram_file_id, caption, status")
+    .select(
+      "donation_code, donor_user_id, media_type, telegram_file_id, caption, status, channel_message_id"
+    )
     .eq("donation_code", cleanCode)
     .eq("status", "published")
     .maybeSingle();
 
   const normalized = normalizeDonationPayload(data);
   if (error || !normalized || !normalized.media_type || !normalized.telegram_file_id) {
-    console.warn("[Donation Record Invalid/Not Found]:", {
-      code: cleanCode,
-      dbError: error?.message || null,
-      rawMediaType: data?.media_type ?? null,
-    });
     return null;
   }
 
@@ -238,7 +317,7 @@ async function getDonationRecord(code) {
   return normalized;
 }
 
-async function getRatingCounts(code) {
+async function getRatingCounts(code, cachedRedisCountsRaw = null) {
   const now = Date.now();
   const mem = ratingSummaryCache.get(code);
   if (mem && mem.expiresAt > now) {
@@ -246,7 +325,10 @@ async function getRatingCounts(code) {
   }
 
   const redisKey = `donation_counts:${code}`;
-  const redisCached = parseJsonSafe(await redis.get(redisKey));
+  const rawRedis =
+    cachedRedisCountsRaw !== undefined ? cachedRedisCountsRaw : await redis.get(redisKey);
+  const redisCached = parseJsonSafe(rawRedis);
+
   if (redisCached && typeof redisCached === "object") {
     ratingSummaryCache.set(code, { counts: redisCached, expiresAt: now + RATING_SUMMARY_TTL_MS });
     return redisCached;
@@ -257,21 +339,50 @@ async function getRatingCounts(code) {
     .select("score")
     .eq("donation_code", code);
 
-  const counts = buildEmptyCounts();
-  if (!error && Array.isArray(data)) {
-    for (const row of data) {
-      const s = Number(row.score);
-      if (s >= 1 && s <= 5) counts[s] += 1;
-    }
-  }
+  const counts = error ? buildEmptyCounts() : summarizeRatingRows(data);
 
   await redis.set(redisKey, JSON.stringify(counts), { ex: 60 });
   ratingSummaryCache.set(code, { counts, expiresAt: now + RATING_SUMMARY_TTL_MS });
   return counts;
 }
 
-async function getRemainingQuota(userId) {
-  const usedRaw = await redis.get(getQuotaKey(userId));
+async function syncChannelRatingCaption(code, donation, counts) {
+  const channelMsgId = donation?.channel_message_id;
+  if (!channelMsgId) return;
+
+  // Jeda 3 detik per kode donasi agar aman dari flood editMessageCaption saat banyak vote masuk
+  const throttleKey = `channel_edit_lock:${code}`;
+  const acquired = await redis.set(throttleKey, "1", { nx: true, ex: 3 });
+  if (!acquired) return;
+
+  const updatedChannelCaption = buildChannelCaption(
+    code,
+    donation.media_type,
+    donation.caption,
+    counts
+  );
+
+  try {
+    await bot.telegram.editMessageCaption(
+      PRIVATE_CHANNEL_ID,
+      Number(channelMsgId),
+      undefined,
+      updatedChannelCaption,
+      {
+        parse_mode: "HTML",
+        reply_markup: buildChannelKeyboard(code).reply_markup,
+      }
+    );
+  } catch (err) {
+    const msg = String(err?.message || "");
+    if (!msg.includes("message is not modified")) {
+      console.error("[Edit Channel Caption Error]:", msg);
+    }
+  }
+}
+
+async function getRemainingQuota(userId, cachedQuotaRaw = null) {
+  const usedRaw = cachedQuotaRaw !== undefined ? cachedQuotaRaw : await redis.get(getQuotaKey(userId));
   const used = Math.max(0, Number(usedRaw) || 0);
   return {
     used,
@@ -378,38 +489,24 @@ function extractMediaPayload(msg) {
   return null;
 }
 
-async function deliverDonationMedia(ctx, code, data, counts) {
+async function deliverDonationMedia(ctx, code, data) {
   const normalized = normalizeDonationPayload(data);
 
   if (!normalized || !normalized.telegram_file_id) {
-    console.error("[Deliver Media Error] Payload kosong/tidak valid:", { code, data });
     return ctx.reply("Data media tidak ditemukan atau file sudah tidak tersedia.");
   }
 
   if (!normalized.media_type) {
-    console.error("[Deliver Media Error] Tipe media tidak dikenali:", {
-      code,
-      rawMediaType: normalized.raw_media_type,
-    });
     return ctx.reply(
       `Tipe media tidak dikenali (${escapeHtml(String(normalized.raw_media_type || "kosong"))}).`
     );
   }
 
-  const lines = [
-    "<b>Hasil Donasi Media</b>",
-    `Kode: <code>${escapeHtml(code)}</code>`,
-  ];
-
-  if (normalized.caption) {
-    lines.push(`Judul / Caption: ${escapeHtml(normalized.caption)}`);
-  }
-
   const extra = {
-    caption: lines.join("\n"),
+    caption: buildBotMediaCaption(code, normalized.caption),
     parse_mode: "HTML",
     protect_content: true,
-    ...buildRatingKeyboard(code, counts),
+    ...buildSingleTapRatingKeyboard(code),
   };
 
   if (normalized.media_type === "photo") {
@@ -425,34 +522,50 @@ bot.start(async (ctx) => {
   if (ctx.chat?.type !== "private") return;
 
   const userId = ctx.from.id;
-  await ensureBotUser(ctx.from);
-
-  if (await isUserBanned(userId)) {
-    return ctx.reply("Akun kamu dibatasi untuk menggunakan bot ini.");
-  }
-
   const payload = ctx.startPayload?.trim();
 
   if (payload && /^d_[a-f0-9]{8}$/.test(payload)) {
     const code = payload;
-    const [donation, allJoined] = await Promise.all([
-      getDonationRecord(code),
+
+    const [rawBan, rawMeta] = await redis.mget(`ban_status:${userId}`, `donation_meta:${code}`);
+
+    const [banned, donation, allJoined] = await Promise.all([
+      resolveBanStatus(userId, rawBan),
+      getDonationRecord(code, rawMeta),
       checkRequiredMembership(ctx, userId),
     ]);
 
+    const syncUserPromise = ensureBotUserCached(ctx.from);
+
+    if (banned) {
+      await syncUserPromise;
+      return ctx.reply("Akun kamu dibatasi untuk menggunakan bot ini.");
+    }
+
     if (!donation) {
+      await syncUserPromise;
       return ctx.reply("Kode donasi tidak ditemukan atau sudah kedaluwarsa.");
     }
 
     if (!allJoined) {
+      await syncUserPromise;
       return sendJoinRequirement(ctx, code);
     }
 
-    const counts = await getRatingCounts(code);
-    return deliverDonationMedia(ctx, code, donation, counts);
+    await syncUserPromise;
+    return deliverDonationMedia(ctx, code, donation);
   }
 
-  const quota = await getRemainingQuota(userId);
+  const [rawBan, rawQuota] = await redis.mget(`ban_status:${userId}`, getQuotaKey(userId));
+  const [banned, quota] = await Promise.all([
+    resolveBanStatus(userId, rawBan),
+    getRemainingQuota(userId, rawQuota),
+    ensureBotUserCached(ctx.from),
+  ]);
+
+  if (banned) {
+    return ctx.reply("Akun kamu dibatasi untuk menggunakan bot ini.");
+  }
 
   await ctx.reply(
     [
@@ -473,11 +586,16 @@ bot.start(async (ctx) => {
 
 bot.action("start_donate", async (ctx) => {
   const userId = ctx.from.id;
-  if (await isUserBanned(userId)) {
+  const [rawBan, rawQuota] = await redis.mget(`ban_status:${userId}`, getQuotaKey(userId));
+  const [banned, quota] = await Promise.all([
+    resolveBanStatus(userId, rawBan),
+    getRemainingQuota(userId, rawQuota),
+  ]);
+
+  if (banned) {
     return ctx.answerCbQuery("Akses ditolak.", { show_alert: true });
   }
 
-  const quota = await getRemainingQuota(userId);
   if (quota.remaining <= 0) {
     await ctx.answerCbQuery("Kuota donasi harian habis", { show_alert: true });
     return ctx.reply(
@@ -511,60 +629,98 @@ bot.command("cancel", async (ctx) => {
   await ctx.reply("Proses donasi dibatalkan.");
 });
 
+// Rating satu kali tekan per akun: hasil tampil & diperbarui di postingan Channel Private
 bot.action(/^rate:(d_[a-f0-9]{8}):([1-5])$/, async (ctx) => {
   const code = ctx.match[1];
   const score = Number(ctx.match[2]);
   const voterId = ctx.from.id;
+  const votedKey = getUserVotedKey(code, voterId);
 
-  if (await isUserBanned(voterId)) {
+  const [rawBan, rawMeta, alreadyVotedRedis] = await redis.mget(
+    `ban_status:${voterId}`,
+    `donation_meta:${code}`,
+    votedKey
+  );
+
+  const [banned, donation] = await Promise.all([
+    resolveBanStatus(voterId, rawBan),
+    getDonationRecord(code, rawMeta),
+    ensureBotUserCached(ctx.from),
+  ]);
+
+  if (banned) {
     return ctx.answerCbQuery("Akses ditolak.", { show_alert: true });
   }
 
-  const donation = await getDonationRecord(code);
   if (!donation) {
     return ctx.answerCbQuery("Data donasi tidak ditemukan.", { show_alert: true });
   }
 
-  await ensureBotUser(ctx.from);
+  if (alreadyVotedRedis) {
+    return ctx.answerCbQuery("Kamu sudah memberikan rating untuk media ini.", {
+      show_alert: true,
+    });
+  }
 
-  const { error } = await supabase.from("donation_ratings").upsert(
-    {
-      donation_code: code,
-      voter_user_id: voterId,
-      score,
-      updated_at: new Date().toISOString(),
-    },
-    { onConflict: "donation_code,voter_user_id" }
-  );
+  // Cek ke Supabase apakah user sudah pernah memberi rating (hanya insert jika belum ada)
+  const { data: existingVote } = await supabase
+    .from("donation_ratings")
+    .select("score")
+    .eq("donation_code", code)
+    .eq("voter_user_id", voterId)
+    .maybeSingle();
 
-  if (error) {
-    console.error("[Rating Upsert Error]:", error.message);
+  if (existingVote) {
+    await redis.set(votedKey, String(existingVote.score));
+    return ctx.answerCbQuery(
+      `Kamu sudah memberi rating ${existingVote.score}★ untuk media ini.`,
+      { show_alert: true }
+    );
+  }
+
+  const { error: insertError } = await supabase.from("donation_ratings").insert({
+    donation_code: code,
+    voter_user_id: voterId,
+    score,
+  });
+
+  if (insertError) {
+    if (insertError.code === "23505") {
+      await redis.set(votedKey, String(score));
+      return ctx.answerCbQuery("Kamu sudah memberikan rating untuk media ini.", {
+        show_alert: true,
+      });
+    }
+    console.error("[Rating Insert Error]:", insertError.message);
     return ctx.answerCbQuery("Gagal menyimpan rating.", { show_alert: true });
   }
 
-  // Refresh cache ringkasan rating di memori & Redis
+  await redis.set(votedKey, String(score));
   ratingSummaryCache.delete(code);
   await redis.del(`donation_counts:${code}`);
-  const counts = await getRatingCounts(code);
 
-  try {
-    await ctx.editMessageReplyMarkup(buildRatingKeyboard(code, counts).reply_markup);
-  } catch {
-    // Abaikan jika markup tidak berubah
-  }
+  const counts = await getRatingCounts(code, null);
 
-  await ctx.answerCbQuery(`Rating ${score} bintang tersimpan untuk ${code}`);
+  await Promise.all([
+    syncChannelRatingCaption(code, donation, counts),
+    ctx.answerCbQuery(`Rating ${score}★ tercatat. Terima kasih!`),
+  ]);
 });
 
 bot.on(["photo", "video", "document"], async (ctx) => {
   if (ctx.chat?.type !== "private") return;
 
   const userId = ctx.from.id;
-  if (await isUserBanned(userId)) {
+  const [rawBan, state, cooldownTtl] = await Promise.all([
+    redis.get(`ban_status:${userId}`),
+    redis.get(`donate_state:${userId}`),
+    cooldownSeconds > 0 ? redis.ttl(getCooldownKey(userId)) : Promise.resolve(0),
+  ]);
+
+  if (await resolveBanStatus(userId, rawBan)) {
     return ctx.reply("Akun kamu dibatasi untuk menggunakan bot ini.");
   }
 
-  const state = await redis.get(`donate_state:${userId}`);
   if (state !== "awaiting_media") {
     return ctx.reply(
       "Untuk mengirim donasi media, tekan tombol <b>Donasi</b> lewat /start terlebih dahulu.",
@@ -582,14 +738,11 @@ bot.on(["photo", "video", "document"], async (ctx) => {
     return ctx.reply("Konfigurasi copyright admin belum tersedia. Silakan hubungi admin.");
   }
 
-  if (cooldownSeconds > 0) {
-    const ttl = await redis.ttl(getCooldownKey(userId));
-    if (ttl > 0) {
-      return ctx.reply(
-        `Terlalu cepat. Tunggu <b>${ttl} detik</b> sebelum mengirim donasi berikutnya.`,
-        { parse_mode: "HTML" }
-      );
-    }
+  if (cooldownSeconds > 0 && Number(cooldownTtl) > 0) {
+    return ctx.reply(
+      `Terlalu cepat. Tunggu <b>${Number(cooldownTtl)} detik</b> sebelum mengirim donasi berikutnya.`,
+      { parse_mode: "HTML" }
+    );
   }
 
   const quotaKey = getQuotaKey(userId);
@@ -599,24 +752,25 @@ bot.on(["photo", "video", "document"], async (ctx) => {
   }
 
   if (newCount > dailyLimit) {
-    await redis.set(quotaKey, dailyLimit, { keepttl: true });
-    await redis.del(`donate_state:${userId}`);
+    await Promise.all([
+      redis.set(quotaKey, dailyLimit, { keepttl: true }),
+      redis.del(`donate_state:${userId}`),
+    ]);
     return ctx.reply(
       `Kuota donasi harian kamu sudah habis (<b>${dailyLimit}/${dailyLimit}</b>). Silakan coba lagi besok.`,
       { parse_mode: "HTML" }
     );
   }
 
-  await redis.del(`donate_state:${userId}`);
-  if (cooldownSeconds > 0) {
-    await redis.set(getCooldownKey(userId), "1", { ex: cooldownSeconds });
-  }
-
-  await ensureBotUser(ctx.from);
+  await Promise.all([
+    redis.del(`donate_state:${userId}`),
+    cooldownSeconds > 0 ? redis.set(getCooldownKey(userId), "1", { ex: cooldownSeconds }) : Promise.resolve(),
+    ensureBotUserCached(ctx.from),
+  ]);
 
   const caption = (ctx.message.caption || "").trim().slice(0, 800);
   const code = generateDonationCode();
-  const deepLink = `https://t.me/${BOT_USERNAME}?start=${code}`;
+  const initialCounts = buildEmptyCounts();
 
   const { data: inserted, error: insertError } = await supabase
     .from("media_donations")
@@ -631,54 +785,56 @@ bot.on(["photo", "video", "document"], async (ctx) => {
       caption,
       status: "published",
     })
-    .select("donation_code, donor_user_id, media_type, telegram_file_id, caption, status")
+    .select(
+      "donation_code, donor_user_id, media_type, telegram_file_id, caption, status, channel_message_id"
+    )
     .single();
 
   if (insertError || !inserted) {
-    await redis.decr(quotaKey);
-    if (cooldownSeconds > 0) await redis.del(getCooldownKey(userId));
+    await Promise.all([
+      redis.decr(quotaKey),
+      cooldownSeconds > 0 ? redis.del(getCooldownKey(userId)) : Promise.resolve(),
+    ]);
     console.error("[Supabase Insert Donation Error]:", insertError?.message || insertError);
     return ctx.reply("Gagal menyimpan data donasi. Kuota kamu tidak terpakai, silakan coba lagi.");
   }
 
-  const channelLines = [
-    "<b>Copyright Media Donasi</b>",
-    `Kode Akses: <code>${escapeHtml(code)}</code>`,
-    `Tipe: ${escapeHtml(media.mediaType.toUpperCase())}`,
-  ];
-  if (caption) {
-    channelLines.push(`Caption: ${escapeHtml(caption)}`);
-  }
+  let channelMessageId = null;
+  const channelCaption = buildChannelCaption(code, media.mediaType, caption, initialCounts);
 
   try {
-    await ctx.telegram.sendPhoto(PRIVATE_CHANNEL_ID, COPYRIGHT_PHOTO, {
-      caption: channelLines.join("\n"),
+    const sentChannelMsg = await ctx.telegram.sendPhoto(PRIVATE_CHANNEL_ID, COPYRIGHT_PHOTO, {
+      caption: channelCaption,
       parse_mode: "HTML",
-      ...Markup.inlineKeyboard([[Markup.button.url("Lihat Media di Bot", deepLink)]]),
+      ...buildChannelKeyboard(code),
     });
+    channelMessageId = sentChannelMsg?.message_id || null;
   } catch (err) {
-    await supabase
-      .from("media_donations")
-      .update({ status: "removed", updated_at: new Date().toISOString() })
-      .eq("donation_code", code);
-    await redis.decr(quotaKey);
-    if (cooldownSeconds > 0) await redis.del(getCooldownKey(userId));
+    await Promise.all([
+      supabase
+        .from("media_donations")
+        .update({ status: "removed", updated_at: new Date().toISOString() })
+        .eq("donation_code", code),
+      redis.decr(quotaKey),
+      cooldownSeconds > 0 ? redis.del(getCooldownKey(userId)) : Promise.resolve(),
+    ]);
     console.error("[Send Copyright Channel Error]:", err?.message || err);
     return ctx.reply("Gagal mengirim postingan ke Channel Private. Kuota kamu tidak terpakai, silakan coba lagi.");
   }
 
-  const normalizedInserted = normalizeDonationPayload(inserted) || inserted;
-  await redis.set(`donation_meta:${code}`, JSON.stringify(normalizedInserted), { ex: 300 });
+  if (channelMessageId) {
+    await supabase
+      .from("media_donations")
+      .update({ channel_message_id: channelMessageId })
+      .eq("donation_code", code);
+  }
+
+  const normalizedInserted =
+    normalizeDonationPayload({ ...inserted, channel_message_id: channelMessageId }) || inserted;
+
   donationMetaCache.set(code, {
     data: normalizedInserted,
     expiresAt: Date.now() + DONATION_META_TTL_MS,
-  });
-
-  await supabase.from("donation_audit_logs").insert({
-    donation_code: code,
-    target_user_id: userId,
-    action: "created",
-    details: { media_type: media.mediaType },
   });
 
   const remainingAfter = Math.max(0, dailyLimit - newCount);
@@ -687,18 +843,27 @@ bot.on(["photo", "video", "document"], async (ctx) => {
     userButtons.push([Markup.button.url("Buka Channel Private", PRIVATE_CHANNEL_INVITE_URL)]);
   }
 
-  await ctx.reply(
-    [
-      "<b>Donasi sudah dibagikan</b>",
-      "",
-      `Media tersimpan dengan kode <code>${escapeHtml(code)}</code> dan sudah diteruskan ke <b>Channel Private</b>.`,
-      `Sisa kuota hari ini: <b>${remainingAfter}/${dailyLimit}</b>`,
-    ].join("\n"),
-    {
-      parse_mode: "HTML",
-      ...(userButtons.length > 0 ? Markup.inlineKeyboard(userButtons) : {}),
-    }
-  );
+  await Promise.all([
+    redis.set(`donation_meta:${code}`, JSON.stringify(normalizedInserted), { ex: 300 }),
+    supabase.from("donation_audit_logs").insert({
+      donation_code: code,
+      target_user_id: userId,
+      action: "created",
+      details: { media_type: media.mediaType, channel_message_id: channelMessageId },
+    }),
+    ctx.reply(
+      [
+        "<b>Donasi sudah dibagikan</b>",
+        "",
+        `Media tersimpan dengan kode <code>${escapeHtml(code)}</code> dan sudah diteruskan ke <b>Channel Private</b>.`,
+        `Sisa kuota hari ini: <b>${remainingAfter}/${dailyLimit}</b>`,
+      ].join("\n"),
+      {
+        parse_mode: "HTML",
+        ...(userButtons.length > 0 ? Markup.inlineKeyboard(userButtons) : {}),
+      }
+    ),
+  ]);
 });
 
 bot.on("text", async (ctx) => {
@@ -719,11 +884,14 @@ bot.catch((err, ctx) => {
 });
 
 export default async function handler(req, res) {
+  const startedAt = Date.now();
+
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
       runtime: "vercel-serverless",
       storage: "supabase+upstash-redis",
+      features: ["single-tap-rating", "channel-rating-caption"],
     });
   }
 
@@ -745,9 +913,10 @@ export default async function handler(req, res) {
     }
 
     await bot.handleUpdate(update);
+    console.info(`[Webhook OK] duration_ms=${Date.now() - startedAt}`);
     return res.status(200).json({ ok: true });
   } catch (err) {
-    console.error("[Webhook Handler Error]:", err?.message || err);
+    console.error(`[Webhook Handler Error] duration_ms=${Date.now() - startedAt}:`, err?.message || err);
     return res.status(200).json({ ok: false, error: "Handled internally" });
   }
 }
